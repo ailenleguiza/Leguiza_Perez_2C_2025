@@ -5,16 +5,19 @@
  * Este proyecto ejemplifica el uso del módulo de comunicación 
  * Bluetooth Low Energy (BLE), junto con el cálculo de la FFT 
  * de una señal EMG adquirida desde un canal analógico.
- * Permite graficar en una aplicación móvil la FFT de la señal.
+ * Permite graficar en una aplicación móvil la FFT de la señal,
+ * y detectar la fatiga muscular mediante el análisis espectral.
  *
  * @section changelog Changelog
  *
  * |   Date	    | Description                                    |
  * |:----------:|:-----------------------------------------------|
- * | 22/10/2025 | Código adaptado a EMG real con buffer circular  |
+ * | 22/10/2025 | Código adaptado a EMG real con buffer circular |
+ * | 28/10/2025 | Se agrega detección de fatiga mediante FFT     |
  *
- * @author Florencia Ailen Leguiza Scandizzo
- *         María de los Ángeles Perez
+ * @authors 
+ * Florencia Ailen Leguiza Scandizzo  
+ * María de los Ángeles Perez
  *
  */
 
@@ -22,6 +25,7 @@
 #include <stdio.h>
 #include <stdint.h>
 #include <string.h>
+#include <math.h>
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -34,16 +38,20 @@
 #include "iir_filter.h"
 
 #include "analog_io_mcu.h"
-/*#include "uart_mcu.h"*/
 #include "timer_mcu.h"
 
 /*==================[macros and definitions]=================================*/
 #define CONFIG_BLINK_PERIOD 500
 #define LED_BT	            LED_1
-#define BUFFER_SIZE         256     // Ventana FFT
-#define EMG_BUFFER_LEN      1024    // Buffer circular
-#define SAMPLE_FREQ	        220     // Hz
+#define BUFFER_SIZE         512     // Ventana FFT
+#define EMG_BUFFER_LEN      512    // Buffer circular
+#define SAMPLE_FREQ	        512     // Hz
 #define ADC_CH_EMG          CH1
+
+// Parámetros de detección de fatiga
+#define FATIGUE_THRESHOLD     0.15f   // 15% de descenso
+#define BASELINE_WINDOWS      5       // Ventanas para calcular f_ref
+#define CONSECUTIVE_WINDOWS   3       // Ventanas consecutivas necesarias
 
 /*==================[internal data definition]===============================*/
 static float emg_buffer[EMG_BUFFER_LEN];   // buffer circular para EMG
@@ -58,23 +66,63 @@ static float f[BUFFER_SIZE/2];
 
 TaskHandle_t emg_task_handle = NULL;
 
+/*==================[variables para análisis de fatiga]======================*/
+static float f_ref = 0.0f;           // Frecuencia de referencia
+static float f_mean = 0.0f;          // Frecuencia media actual
+static float f_median = 0.0f;        // Frecuencia mediana actual
+static float rms_value = 0.0f;       // RMS actual de la ventana
+static int window_counter = 0;       // Contador de ventanas procesadas
+static int fatigue_consecutive = 0;  // Ventanas consecutivas en fatiga
+static bool fatigue_detected = false;
+
 /*==================[internal functions declaration]=========================*/
 /**
- * @brief Función que se ejecuta al recibir datos por BLE.
+ * @brief Limpia los vectores de datos de la FFT y borra las gráficas en la app BLE.
  *
- * @param data      Puntero a array de datos recibidos
- * @param length    Longitud del array de datos recibidos
+ * Esta función pone en cero los arreglos emg_fft[], emg_filt_fft[] y f[],
+ * y además envía los comandos de borrado de gráficos por Bluetooth
+ * (*H#* y *X#*) para que se vacíen las curvas en la aplicación.
+ */
+static void ClearFFTData(void){
+    // Vaciar los vectores de la FFT
+    for (int i = 0; i < BUFFER_SIZE/2; i++) {
+        emg_fft[i] = 0.0f;
+        emg_filt_fft[i] = 0.0f;
+        f[i] = 0.0f;
+    }
+
+    // Enviar comandos de borrado de gráficos BLE
+    BleSendString("*H#*\n");  // Limpia gráfico FFT cruda
+    BleSendString("*X#*\n");  // Limpia gráfico FFT filtrada
+}
+/**
+ * @brief Función de callback que se ejecuta cuando se reciben datos por BLE.
+ *
+ * Si se recibe el carácter 'R', notifica la tarea EMGTask para procesar
+ * una nueva ventana de datos EMG.  
+ * Si se recibe el carácter 'B', se borra la gráfica de la FFT y
+ * se limpian los vectores de datos asociados.
+ *
+ * @param data   Puntero al arreglo de bytes recibidos.
+ * @param length Longitud del mensaje recibido.
  */
 void read_data(uint8_t * data, uint8_t length){
-	if(data[0] == 'R'){
+    if(data[0] == 'R'){
         xTaskNotifyGive(emg_task_handle);
+    }
+    else if(data[0] == 'B'){
+        ClearFFTData();
     }
 }
 
+
 /**
- * @brief Escribe una muestra en el buffer circular EMG.
+ * @brief Escribe una muestra nueva en el buffer circular EMG.
  *
- * @param sample Valor leído del ADC
+ * Guarda la muestra en la posición actual y avanza el índice de escritura.
+ * Si el buffer aún no está lleno, incrementa el contador de muestras válidas.
+ *
+ * @param sample Valor leído del ADC (señal EMG).
  */
 static void CircularBufferWrite(float sample){
     emg_buffer[write_index] = sample;
@@ -86,34 +134,108 @@ static void CircularBufferWrite(float sample){
 
 /**
  * @brief Copia las últimas BUFFER_SIZE muestras desde el buffer circular
- *        hacia la ventana de procesamiento para FFT.
+ *        hacia una ventana temporal para el procesamiento FFT.
+ *
+ * @param window Puntero al arreglo destino donde se copiarán las muestras.
  */
 static void CircularBufferReadWindow(float *window){
-    /*uint16_t start = (write_index + EMG_BUFFER_LEN - BUFFER_SIZE) % EMG_BUFFER_LEN;
-    for(int i=0; i<BUFFER_SIZE; i++){
-        window[i] = emg_buffer[(start + i) % EMG_BUFFER_LEN];
-    }*/
-    // Verificar que tenemos suficientes muestras
     if(sample_count < BUFFER_SIZE) {
-        return; // O manejar el error
+        return;
     }
-    
     // Calcular inicio de las últimas BUFFER_SIZE muestras
     uint16_t start = (write_index - BUFFER_SIZE + EMG_BUFFER_LEN) % EMG_BUFFER_LEN;
-    
     for(int i = 0; i < BUFFER_SIZE; i++){
         window[i] = emg_buffer[(start + i) % EMG_BUFFER_LEN];
     }
 }
 
+/*==================[FUNCIONES AUXILIARES DE ANÁLISIS]======================*/
+
 /**
- * @brief Tarea principal EMG: adquiere muestras, filtra, calcula FFT y envía por BLE.
+ * @brief Calcula el valor RMS (Root Mean Square) de un vector.
+ *
+ * Este valor representa la magnitud promedio de la señal,
+ * y sirve como indicador de la activación muscular.
+ *
+ * @param data Puntero al vector de muestras.
+ * @param len  Cantidad de elementos del vector.
+ * @return Valor RMS.
+ */
+static float CalcRMS(float *data, int len){
+    float sum = 0.0f;
+    for(int i=0; i<len; i++) sum += data[i]*data[i];
+    return sqrtf(sum / len);
+}
+
+/**
+ * @brief Calcula la frecuencia media ponderada del espectro.
+ *
+ * Representa el centro de masa espectral y tiende a disminuir con la fatiga.
+ *
+ * @param fft_mag Vector de magnitudes espectrales.
+ * @param freqs   Vector de frecuencias correspondientes.
+ * @param len     Longitud de los vectores (BUFFER_SIZE/2).
+ * @return Frecuencia media (Hz).
+ */
+static float CalcMeanFreq(float *fft_mag, float *freqs, int len){
+    float num = 0.0f, den = 0.0f;
+    for(int i=0; i<len; i++){
+        num += freqs[i] * fft_mag[i];
+        den += fft_mag[i];
+    }
+    return (den > 0) ? num / den : 0.0f;
+}
+
+/**
+ * @brief Calcula la frecuencia mediana del espectro.
+ *
+ * Divide el área espectral en dos mitades iguales de energía.
+ * Es una métrica robusta para estimar la fatiga muscular.
+ *
+ * @param fft_mag Vector de magnitudes espectrales.
+ * @param freqs   Vector de frecuencias correspondientes.
+ * @param len     Longitud de los vectores (BUFFER_SIZE/2).
+ * @return Frecuencia mediana (Hz).
+ */
+static float CalcMedianFreq(float *fft_mag, float *freqs, int len){
+    float total = 0.0f;
+    for(int i=0; i<len; i++) total += fft_mag[i];
+    float half = total / 2.0f;
+    float accum = 0.0f;
+    for(int i=0; i<len; i++){
+        accum += fft_mag[i];
+        if(accum >= half) return freqs[i];
+    }
+    return freqs[len - 1];
+}
+
+/**
+ * @brief Tarea principal EMG: adquiere muestras, calcula FFT,
+ *        obtiene métricas espectrales y detecta fatiga muscular.
+ *
+ * Se ejecuta cada vez que se recibe una notificación (por 'R' vía BLE).
+ * Realiza el filtrado, cálculo de FFT, frecuencias características y
+ * compara la frecuencia mediana con una referencia inicial.
+ * Envía los resultados por Bluetooth Low Energy.
+ *
+ * @param pvParameter Parámetro de tarea (no utilizado).
  */
 static void EMGTask(void *pvParameter){
-    char msg[64];
-    float sample;
+    char msg_ble[128];
     while(true){
         ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+        /*
+        // LIMPIEZA ANTES DE UNA NUEVA MEDICIÓN 
+        for (int i = 0; i < BUFFER_SIZE/2; i++) {
+            emg_fft[i] = 0.0f;
+            emg_filt_fft[i] = 0.0f;
+            f[i] = 0.0f;
+        }
+        for (int i = 0; i < BUFFER_SIZE/2; i++) {
+            sprintf(msg_ble, "*HX%2.2fY%2.2f,X%2.2fY%2.2f*\n",
+                    (float)i, 0.0f, (float)i, 0.0f);
+            BleSendString(msg_ble);
+        }*/
 
         // Tomar BUFFER_SIZE muestras desde buffer circular
         CircularBufferReadWindow(emg_window);
@@ -123,21 +245,73 @@ static void EMGTask(void *pvParameter){
         LowPassFilter(emg_filt, emg_filt, BUFFER_SIZE);
 
         // FFT
-        FFTMagnitude(emg_window, emg_fft, BUFFER_SIZE);
+        FFTMagnitude(emg_window, emg_fft, BUFFER_SIZE); //es la señal sin filtrar, no la usamos
         FFTMagnitude(emg_filt, emg_filt_fft, BUFFER_SIZE);
         FFTFrequency(SAMPLE_FREQ, BUFFER_SIZE, f);
 
-        // Envío BLE
+        /*==================[ANÁLISIS DE FATIGA Y ENVÍO BLE]=====================*/
+        window_counter++;
+
         for(int i=0; i<BUFFER_SIZE/2; i++){
-            sprintf(msg, "*HX%2.2fY%2.2f,X%2.2fY%2.2f*\n", f[i], emg_fft[i], f[i], emg_filt_fft[i]);
-            BleSendString(msg);
-            /* agregar linea para poder graficar la fft filtrada tambien copiando lo de arriba per ocambiando */
+            sprintf(msg_ble, "*HX%2.2fY%2.2f,X%2.2fY%2.2f*\n", f[i], emg_fft[i], f[i], emg_filt_fft[i]);
+            printf("%s",msg_ble);
+            BleSendString(msg_ble);
+        }
+        sprintf(msg_ble, "*TPrueba*\n");
+        BleSendString(msg_ble);
+        
+        // Calcular métricas de la ventana
+        rms_value = CalcRMS(emg_filt, BUFFER_SIZE);
+        printf("RMS: %.2f j\n", rms_value);
+        f_mean    = CalcMeanFreq(emg_filt_fft, f, BUFFER_SIZE/2);
+        printf("Frecuencia media: %.2f Hz\n", f_mean);
+        f_median  = CalcMedianFreq(emg_filt_fft, f, BUFFER_SIZE/2);
+        printf("Frecuencia mediana: %.2f Hz\n", f_median);
+
+        // Enviar métricas actuales por BLE
+        sprintf(msg_ble, "*T fmean:%.2fHz, fmed:%.2fHz, fref:%.2fHz, RMS:%.2f*\n", f_mean, f_median, f_ref, rms_value);
+        BleSendString(msg_ble);
+
+        // Calcular frecuencia de referencia (f_ref)
+        if(window_counter <= BASELINE_WINDOWS){
+            f_ref += f_median;
+            if(window_counter == BASELINE_WINDOWS){
+                f_ref /= BASELINE_WINDOWS;
+                sprintf(msg_ble, "*Tf_ref establecida: %.2f Hz*\n", f_ref);
+                printf("Frecuencia de referencia establecida: %.2f Hz\n", f_ref);
+                BleSendString(msg_ble);
+            }
+        }
+        // Luego del baseline, comparar con umbral
+        else if(f_ref > 0.0f){
+            float drop = (f_ref - f_median) / f_ref;
+           
+
+            // Evaluar fatiga
+            if(drop > FATIGUE_THRESHOLD){
+                fatigue_consecutive++;
+                if(fatigue_consecutive >= CONSECUTIVE_WINDOWS && !fatigue_detected){
+                    fatigue_detected = true;
+                    sprintf(msg_ble, "*TFATIGA DETECTADA (↓%.1f%% respecto a ref)*\n", drop * 100.0f);
+                    printf("*** FATIGA DETECTADA *** Drop: %.2f%%\n", drop * 100.0f);
+                    BleSendString(msg_ble);
+                }
+            } else {
+                fatigue_consecutive = 0;
+                printf("Sin fatiga - Drop: %.2f%% (consecutivos reset)\n", drop * 100.0f);
+            }
         }
     }
 }
 
+
 /**
- * @brief Timer ISR: lee ADC y guarda en buffer circular
+ * @brief Rutina de interrupción del temporizador.
+ *
+ * Se ejecuta a la frecuencia de muestreo definida y adquiere
+ * una muestra analógica del canal EMG, almacenándola en el buffer circular.
+ *
+ * @param param Parámetro del temporizador (no utilizado).
  */
 void EMG_TimerISR(void *param){
     uint16_t adc_val;
@@ -145,7 +319,13 @@ void EMG_TimerISR(void *param){
     CircularBufferWrite((float)adc_val);
 }
 
-/*==================[external functions definition]==========================*/
+/**
+ * @brief Función principal de la aplicación.
+ *
+ * Inicializa los periféricos: LEDs, BLE, ADC, temporizador y FFT.
+ * Crea la tarea EMG encargada del procesamiento de señal y detección de fatiga.
+ * El bucle principal actualiza el estado del LED según el estado del BLE.
+ */
 void app_main(void){
     // Inicializaciones
     LedsInit();
@@ -181,7 +361,7 @@ void app_main(void){
     TimerStart(TIMER_A);
 
     // Tarea EMG
-    xTaskCreate(&EMGTask, "EMG", 2048, NULL, 5, &emg_task_handle);
+    xTaskCreate(&EMGTask, "EMG", 4096, NULL, 5, &emg_task_handle);
 
     // Loop principal: indica estado BLE
     while(1){
